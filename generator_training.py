@@ -115,12 +115,12 @@ start = time.time()
 all_losses = []
 loss_avg = 0
 
-Result_folder='results/'  ### Tong: add a folder to collect results 
-writer = SummaryWriter(Result_folder+'logs') ### Tong: initialize tensorboard writer 
+Result_folder='results/'
+writer = SummaryWriter(Result_folder+'logs')  
 for batch in range(1,n_batches+1):
     inp, target = get_random_batch(train_batches)
     loss = propagation(inp, target, 'train') 
-    writer.add_scalar('Training/Loss',loss, batch)  ### Tong: record loss every step    
+    writer.add_scalar('Training/Loss',loss, batch) 
     loss_avg += loss
     if batch % print_every == 0:
         print('[%s (%d %d%%) %.4f]' % (time_since(start), batch, batch / n_batches * 100, loss))
@@ -130,7 +130,7 @@ for batch in range(1,n_batches+1):
         loss_avg = 0
     if batch %save_every ==0 or batch==1:
         print('[Debug] Saving model')
-        torch.save(model.state_dict(), Result_folder+'models/mytraining_{}.pt'.format(batch)) ### Tong: add index to avoid model overwrite 
+        torch.save(model.state_dict(), Result_folder+'models/mytraining_{}.pt'.format(batch))
         print ('[Debug] Finished saving model')
 
 
