@@ -1,137 +1,161 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
-from data_loading import *
-from torch.utils.tensorboard import SummaryWriter 
-'''
-the model
-'''
-class generative_model(nn.Module):
-    def __init__(self, vocabs_size, hidden_size, output_size, embedding_dimension, n_layers):
-        super(generative_model, self).__init__()
-        self.vocabs_size = vocabs_size
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.embedding_dimension = embedding_dimension
-        self.n_layers = n_layers
+import time
+import os
+from torch.utils.tensorboard import SummaryWriter
+from typing import Tuple, Optional
 
-        self.embedding = nn.Embedding(vocabs_size, embedding_dimension)
-        self.rnn = nn.LSTM(embedding_dimension, hidden_size, n_layers, dropout = 0.2)
-        self.linear = nn.Linear(hidden_size, output_size)
+from model import GenerativeModel
+from data_loading import load_data, process_data_to_batches, get_random_batch, time_since, tensor_from_chars_list
+from config import TrainingConfig
+
+
+def setup_training() -> Tuple[TrainingConfig, GenerativeModel, torch.optim.Optimizer, nn.CrossEntropyLoss]:
+    """Initialize training configuration and components."""
+    config = TrainingConfig()
     
-    def forward(self, input, hidden):
-        batch_size = input.size(0)
-        input = self.embedding(input)
-        output, hidden = self.rnn(input.view(1, batch_size, -1), hidden)
-        output = self.linear(output.view(batch_size, -1))
-        return output, hidden
-
-    def init_hidden(self, batch_size):
-        hidden=(Variable(torch.zeros(self.n_layers, batch_size, self.hidden_size)),
-                Variable(torch.zeros(self.n_layers, batch_size, self.hidden_size)))
-        return hidden
-
-data,vocabs=load_data()
-#data=data[:1000]  ### smaller dataset to debug your code  
-vocabs = list(vocabs)
-vocabs_size = len(vocabs)
-output_size = len(vocabs)
-batch_size = 128
-#batch_size = 20
-cuda = False
-hidden_size = 1024
-embedding_dimension =  248
-n_layers=3
-lr = 0.005
-#n_batches=5
-n_batches =  200000
-#print_every = 100
-print_every = 100
-plot_every = 10
-#save_every = 100
-save_every = 1#1000
-end_token = ' '
-
-print("processing batches ...")
-train_batches,val_batches = process_data_to_batches(data,batch_size,vocabs,cuda)
-print("finish processing batches")
+    # Load data
+    data, vocab_array = load_data(config.data_path)
+    vocab = list(vocab_array)
+    vocab_size = len(vocab)
+    
+    # Initialize model
+    model = GenerativeModel(
+        vocab_size=vocab_size,
+        hidden_size=config.hidden_size,
+        embedding_dim=config.embedding_dim,
+        n_layers=config.n_layers,
+        dropout=config.dropout
+    )
+    
+    # Move to device if available
+    device = torch.device('cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu')
+    model = model.to(device)
+    config.device = str(device)
+    
+    # Initialize optimizer and loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    criterion = nn.CrossEntropyLoss()
+    
+    return config, model, optimizer, criterion, vocab, data
 
 
-model = generative_model(vocabs_size,hidden_size,output_size,embedding_dimension,n_layers)
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-criterion = nn.CrossEntropyLoss()
+def prepare_data(data, config, vocab):
+    """Prepare training and validation batches."""
+    print("Processing batches...")
+    train_batches, val_batches = process_data_to_batches(
+        data, config.batch_size, vocab, config.device
+    )
+    print(f"Finished processing batches. Train: {len(train_batches)}, Val: {len(val_batches)}")
+    return train_batches, val_batches
 
-if cuda:
-    model = model.cuda()
-    criterion = criterion.cuda()
 
-def propagation(inp, target, mode):
+def train_step(
+    model: GenerativeModel, 
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.CrossEntropyLoss,
+    inp: torch.Tensor, 
+    target: torch.Tensor,
+    device: str
+) -> float:
+    """Perform a single training step."""
+    model.train()
     batch_size = inp.size(0)
     sequence_length = inp.size(1)
-    hidden = model.init_hidden(batch_size)
-    if cuda:
-        hidden = (hidden[0].cuda(), hidden[1].cuda())
-    if mode=='train':
-        model.zero_grad()
-    loss = 0
-    for c in range(sequence_length):
-        output, hidden = model(inp[:,c], hidden)
-        loss += criterion(output, target[:,c])
-    if mode=='train':
-        loss.backward()
-        optimizer.step()
-        return loss.item()/sequence_length
-#    return loss.data[0]/sequence_length
+    
+    hidden = model.init_hidden(batch_size, device)
+    model.zero_grad()
+    
+    total_loss = 0
+    for t in range(sequence_length):
+        output, hidden = model(inp[:, t], hidden)
+        loss = criterion(output, target[:, t])
+        total_loss += loss
+    
+    total_loss.backward()
+    optimizer.step()
+    
+    return total_loss.item() / sequence_length
 
 
-def evaluate(prime_str='!', temperature=0.4):
-    max_length = 200
-    inp = Variable(tensor_from_chars_list(prime_str,vocabs))
-    if cuda:
-        inp = Variable(tensor_from_chars_list(prime_str,vocabs,cuda)).cuda()
-    batch_size = inp.size(0)
-    hidden = model.init_hidden(batch_size)
-    if cuda:
-        hidden = (hidden[0].cuda(), hidden[1].cuda())
-    predicted = prime_str
-    while True:
-        output, hidden = model(inp, hidden)
-        # Sample from the network as a multinomial distribution
-        output_dist = output.data.view(-1).div(temperature).exp()
-        top_i = torch.multinomial(output_dist, 1)[0]
-        # Add predicted character to string and use as next input
-        predicted_char = vocabs[top_i]
-
-        if predicted_char ==end_token or len(predicted)>max_length:
-            return predicted
-
-        predicted += predicted_char
-        inp = Variable(tensor_from_chars_list(predicted_char,vocabs))
-        if cuda:
-            inp = Variable(tensor_from_chars_list(predicted_char,vocabs,cuda)).cuda()
-    return predicted
-
-start = time.time()
-all_losses = []
-loss_avg = 0
-
-Result_folder='results/'
-writer = SummaryWriter(Result_folder+'logs')  
-for batch in range(1,n_batches+1):
-    inp, target = get_random_batch(train_batches)
-    loss = propagation(inp, target, 'train') 
-    writer.add_scalar('Training/Loss',loss, batch) 
-    loss_avg += loss
-    if batch % print_every == 0:
-        print('[%s (%d %d%%) %.4f]' % (time_since(start), batch, batch / n_batches * 100, loss))
-        print(evaluate('!'), '\n')
-    if batch % plot_every == 0:
-        all_losses.append(loss_avg / plot_every)
-        loss_avg = 0
-    if batch %save_every ==0 or batch==1:
-        print('[Debug] Saving model')
-        torch.save(model.state_dict(), Result_folder+'models/mytraining_{}.pt'.format(batch))
-        print ('[Debug] Finished saving model')
+def evaluate(
+    model: GenerativeModel,
+    vocab: list,
+    config: TrainingConfig,
+    prime_str: str = '!'
+) -> str:
+    """Generate a sample sequence from the model."""
+    model.eval()
+    
+    with torch.no_grad():
+        inp = tensor_from_chars_list(prime_str, vocab, config.device)
+        batch_size = inp.size(0)
+        hidden = model.init_hidden(batch_size, config.device)
+        predicted = prime_str
+        
+        for _ in range(config.max_length):
+            output, hidden = model(inp, hidden)
+            # Sample from the network as a multinomial distribution
+            output_dist = output.data.view(-1).div(config.temperature).exp()
+            top_i = torch.multinomial(output_dist, 1)[0]
+            # Add predicted character to string and use as next input
+            predicted_char = vocab[top_i]
+            
+            if predicted_char == config.end_token:
+                break
+                
+            predicted += predicted_char
+            inp = tensor_from_chars_list(predicted_char, vocab, config.device)
+            
+        return predicted
 
 
+def train_model():
+    """Main training loop."""
+    config, model, optimizer, criterion, vocab, data = setup_training()
+    train_batches, val_batches = prepare_data(data, config, vocab)
+    
+    # Create results directory
+    os.makedirs(f"{config.results_folder}models", exist_ok=True)
+    os.makedirs(f"{config.results_folder}logs", exist_ok=True)
+    
+    # Initialize tensorboard writer
+    writer = SummaryWriter(f"{config.results_folder}logs")
+    
+    start_time = time.time()
+    all_losses = []
+    loss_avg = 0
+    
+    print(f"Starting training on {config.device}...")
+    print(f"Vocabulary size: {len(vocab)}")
+    print(f"Training batches: {len(train_batches)}")
+    
+    for batch_idx in range(1, config.n_batches + 1):
+        inp, target = get_random_batch(train_batches)
+        loss = train_step(model, optimizer, criterion, inp, target, config.device)
+        
+        writer.add_scalar('Training/Loss', loss, batch_idx)
+        loss_avg += loss
+        
+        if batch_idx % config.print_every == 0:
+            progress = batch_idx / config.n_batches * 100
+            elapsed = time_since(start_time)
+            print(f'[{elapsed} ({batch_idx} {progress:.0f}%) {loss:.4f}]')
+            sample = evaluate(model, vocab, config, config.start_token)
+            print(f'{sample}\n')
+        
+        if batch_idx % config.plot_every == 0:
+            all_losses.append(loss_avg / config.plot_every)
+            loss_avg = 0
+        
+        if batch_idx % config.save_every == 0 or batch_idx == 1:
+            model_path = f"{config.results_folder}models/mytraining_{batch_idx}.pt"
+            torch.save(model.state_dict(), model_path)
+            print(f'[Debug] Model saved to {model_path}')
+    
+    writer.close()
+    print("Training completed!")
 
+
+if __name__ == "__main__":
+    train_model()
